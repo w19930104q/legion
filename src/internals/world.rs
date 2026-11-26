@@ -445,6 +445,35 @@ impl World {
         &self.archetypes
     }
 
+    pub(crate) fn entity_locations(&self) -> &LocationMap {
+        &self.entities
+    }
+
+    /// Appends already-cloned entities and their components to the archetype
+    /// matching `filter`, recording their locations. Used by the transactional
+    /// entity tree clone; all component data has been staged before this is
+    /// called, so the operation is infallible.
+    pub(crate) fn commit_clone_group(
+        &mut self,
+        filter: &mut impl ArchetypeSource,
+        cloned_ids: &[Entity],
+        mut write_components: impl FnMut(&mut ArchetypeWriter<'_>),
+    ) {
+        let arch_index = self.get_archetype_for_components(filter);
+        let archetype = &mut self.archetypes[arch_index];
+        let mut writer =
+            ArchetypeWriter::new(arch_index, archetype, self.components.get_multi_mut());
+
+        for entity in cloned_ids {
+            writer.push(*entity);
+        }
+
+        write_components(&mut writer);
+
+        let (base, inserted) = writer.inserted();
+        self.entities.insert(inserted, arch_index, base);
+    }
+
     pub(crate) unsafe fn transfer_archetype(
         &mut self,
         ArchetypeIndex(from): ArchetypeIndex,

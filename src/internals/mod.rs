@@ -1,3 +1,4 @@
+pub mod clone;
 pub mod cons;
 pub mod entity;
 pub mod entry;

@@ -159,6 +159,7 @@
 //! ```
 
 pub use crate::internals::{
+    clone::{CloneError, CloneRegistry},
     entity::{Allocate, Entity, EntityHasher, EntityLocation, LocationMap},
     entry::{ComponentError, Entry, EntryMut, EntryRef},
     event::{Event, EventSender},

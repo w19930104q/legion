@@ -83,6 +83,18 @@ impl Debug for dyn Runnable {
     }
 }
 
+/// Returns `true` if all resources the system declares access to are currently available
+/// (present and not pending removal). Systems with unavailable resource dependencies are
+/// skipped by the executor rather than run against stale or missing state.
+fn resources_available(system: &dyn ParallelRunnable, resources: &UnsafeResources) -> bool {
+    let (reads, _) = system.reads();
+    let (writes, _) = system.writes();
+    reads
+        .iter()
+        .chain(writes.iter())
+        .all(|id| resources.is_available(id))
+}
+
 /// Executes a sequence of systems, potentially in parallel, and then commits their command buffers.
 ///
 /// Systems are provided in execution order. When the `parallel` feature is enabled, the `Executor`
@@ -300,6 +312,10 @@ impl Executor {
     pub fn run_systems(&mut self, world: &mut World, resources: &UnsafeResources) {
         self.systems.iter_mut().for_each(|system| {
             let system = unsafe { system.get_mut() };
+            // skip systems whose resource dependencies have been removed or are pending removal
+            if !resources_available(system, resources) {
+                return;
+            }
             system.prepare(world);
             unsafe { system.run_unsafe(world, resources) };
         });
@@ -318,8 +334,10 @@ impl Executor {
                 // safety: we have exlusive access to all systems, world and resources here
                 unsafe {
                     let system = self.systems[0].get_mut();
-                    system.prepare(world);
-                    system.run_unsafe(world, resources);
+                    if resources_available(system, resources) {
+                        system.prepare(world);
+                        system.run_unsafe(world, resources);
+                    }
                 };
             }
             _ => {
@@ -383,7 +401,11 @@ impl Executor {
     }
 
     /// Flushes the recorded command buffers for all systems.
+    ///
+    /// This is a scheduling boundary: no systems are executing, so resources whose removal
+    /// was deferred are physically dropped here, before any commands run.
     pub fn flush_command_buffers(&mut self, world: &mut World, resources: &mut Resources) {
+        resources.apply_pending_removals();
         self.systems.iter().for_each(|system| {
             // safety: systems are exlcusive due to &mut self
             let system = unsafe { system.get_mut() };
@@ -401,7 +423,12 @@ impl Executor {
     #[cfg(feature = "parallel")]
     unsafe fn run_recursive(&self, i: usize, world: &World, resources: &UnsafeResources) {
         // safety: the caller ensures nothing else is accessing systems[i]
-        self.systems[i].get_mut().run_unsafe(world, resources);
+        let system = self.systems[i].get_mut();
+        // skip systems whose resource dependencies have been removed or are pending removal,
+        // but still cascade to dependants so that ordering is preserved
+        if resources_available(system, resources) {
+            system.run_unsafe(world, resources);
+        }
 
         self.static_dependants[i].par_iter().for_each(|dep| {
             if self.awaiting[*dep].fetch_sub(1, Ordering::Relaxed) == 1 {
@@ -608,9 +635,22 @@ impl Schedule {
                             ToFlush::System(cmd) => cmd.flush(world, resources),
                         }
                     });
+                    // scheduling boundary: physically drop resources whose removal was deferred
+                    resources.apply_pending_removals();
                 }
                 Step::ThreadLocalFn(function) => function(world, resources),
                 Step::ThreadLocalSystem(system) => {
+                    // skip systems whose resource dependencies have been removed or are
+                    // pending removal
+                    let (reads, _) = system.reads();
+                    let (writes, _) = system.writes();
+                    let available = reads
+                        .iter()
+                        .chain(writes.iter())
+                        .all(|id| resources.is_available_id(id));
+                    if !available {
+                        continue;
+                    }
                     system.prepare(world);
                     system.run(world, resources);
                     if let Some(cmd) = system.command_buffer_mut(world.id()) {

@@ -5,7 +5,7 @@
 
 use std::{
     any::TypeId,
-    collections::{hash_map::Entry, HashMap},
+    collections::{HashMap, HashSet},
     fmt::{Display, Formatter},
     hash::{BuildHasherDefault, Hasher},
     marker::PhantomData,
@@ -47,6 +47,29 @@ impl std::hash::Hash for ResourceTypeId {
 impl PartialEq for ResourceTypeId {
     fn eq(&self, other: &Self) -> bool {
         self.type_id.eq(&other.type_id)
+    }
+}
+
+/// Identifies a specific generation of a resource.
+///
+/// Every time a resource of a given type is inserted into [`Resources`], the version of that
+/// resource type is incremented. Comparing versions allows cached handles to detect that the
+/// resource they were fetched from has since been removed and replaced with a new instance.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ResourceVersion(u64);
+
+impl ResourceVersion {
+    /// The version of the first insertion of a resource type.
+    pub const INITIAL: Self = Self(1);
+
+    fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+impl Display for ResourceVersion {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "v{}", self.0)
     }
 }
 
@@ -222,6 +245,13 @@ impl ResourceCell {
 #[derive(Default)]
 pub struct UnsafeResources {
     map: HashMap<ResourceTypeId, ResourceCell, BuildHasherDefault<ComponentTypeIdHasher>>,
+    /// The current generation of each resource type. Survives removal, so that a resource
+    /// which is re-inserted after being removed is assigned a fresh version.
+    versions: HashMap<ResourceTypeId, ResourceVersion, BuildHasherDefault<ComponentTypeIdHasher>>,
+    /// Resources whose removal has been requested but which will only be physically dropped
+    /// at the next scheduling boundary. Logically these resources are already gone: systems
+    /// which declare a dependency on them are skipped, and fetches fail.
+    pending_removals: HashSet<ResourceTypeId, BuildHasherDefault<ComponentTypeIdHasher>>,
 }
 
 unsafe impl Send for UnsafeResources {}
@@ -232,28 +262,70 @@ impl UnsafeResources {
         self.map.contains_key(type_id)
     }
 
-    /// # Safety
-    /// Resources which are `!Sync` or `!Send` must be retrieved or inserted only on the main thread.
-    unsafe fn entry(&mut self, type_id: ResourceTypeId) -> Entry<ResourceTypeId, ResourceCell> {
-        self.map.entry(type_id)
+    /// Returns `true` if a resource of the given type is present and not pending removal.
+    ///
+    /// Systems which declare a resource dependency which is not available are skipped by
+    /// the scheduler.
+    pub(crate) fn is_available(&self, type_id: &ResourceTypeId) -> bool {
+        self.contains(type_id) && !self.pending_removals.contains(type_id)
+    }
+
+    /// Returns the current version of the given resource type, if it has ever been inserted.
+    fn version(&self, type_id: &ResourceTypeId) -> Option<ResourceVersion> {
+        self.versions.get(type_id).copied()
     }
 
     /// # Safety
     /// Resources which are `!Send` must be retrieved or inserted only on the main thread.
     unsafe fn insert<T: Resource>(&mut self, resource: T) {
-        self.map.insert(
-            ResourceTypeId::of::<T>(),
-            ResourceCell::new(Box::new(resource)),
-        );
+        let type_id = ResourceTypeId::of::<T>();
+        // inserting assigns a fresh version, and cancels any pending removal of the old instance
+        let version = self
+            .versions
+            .get(&type_id)
+            .copied()
+            .map_or(ResourceVersion::INITIAL, ResourceVersion::next);
+        self.versions.insert(type_id, version);
+        self.pending_removals.remove(&type_id);
+        self.map.insert(type_id, ResourceCell::new(Box::new(resource)));
     }
 
     /// # Safety
     /// Resources which are `!Send` must be retrieved or inserted only on the main thread.
     unsafe fn remove(&mut self, type_id: &ResourceTypeId) -> Option<Box<dyn Resource>> {
+        self.pending_removals.remove(type_id);
         self.map.remove(type_id).map(|cell| cell.into_inner())
     }
 
+    /// Marks the given resource type for removal at the next scheduling boundary.
+    ///
+    /// The resource remains physically stored (so that outstanding borrows stay valid) but is
+    /// no longer available: dependent systems are skipped and new fetches fail. Returns `true`
+    /// if the resource was present and not already pending removal.
+    ///
+    /// # Safety
+    /// Resources which are `!Send` must be retrieved or inserted only on the main thread.
+    unsafe fn remove_deferred(&mut self, type_id: &ResourceTypeId) -> bool {
+        if !self.contains(type_id) {
+            return false;
+        }
+        self.pending_removals.insert(*type_id)
+    }
+
+    /// Physically drops all resources whose removal was deferred. Called by the scheduler at
+    /// flush boundaries, when no systems are executing and so no borrows can be outstanding.
+    fn apply_pending_removals(&mut self) {
+        let pending = std::mem::take(&mut self.pending_removals);
+        for type_id in pending {
+            self.map.remove(&type_id);
+        }
+    }
+
     fn get(&self, type_id: &ResourceTypeId) -> Option<&ResourceCell> {
+        // resources pending removal are logically already gone
+        if self.pending_removals.contains(type_id) {
+            return None;
+        }
         self.map.get(type_id)
     }
 
@@ -262,7 +334,16 @@ impl UnsafeResources {
     unsafe fn merge(&mut self, mut other: Self) {
         // Merge resources, retaining our local ones but moving in any non-existant ones
         for resource in other.map.drain() {
-            self.map.entry(resource.0).or_insert(resource.1);
+            if !self.map.contains_key(&resource.0) {
+                let version = self
+                    .versions
+                    .get(&resource.0)
+                    .copied()
+                    .map_or(ResourceVersion::INITIAL, ResourceVersion::next);
+                self.versions.insert(resource.0, version);
+                self.pending_removals.remove(&resource.0);
+                self.map.insert(resource.0, resource.1);
+            }
         }
     }
 }
@@ -323,6 +404,57 @@ impl Resources {
         }
     }
 
+    /// Marks the type `T` for removal at the next scheduling boundary.
+    ///
+    /// Unlike [`Resources::remove`], the resource is not dropped immediately. It remains
+    /// physically stored - keeping any outstanding borrows valid - but is logically already
+    /// gone: fetches of `T` will fail, and systems which declare a dependency on `T` are
+    /// skipped by the scheduler. The stored value is physically dropped when the schedule
+    /// next flushes its command buffers (or when [`Resources::apply_pending_removals`] is
+    /// called manually if no schedule is in use).
+    ///
+    /// Re-inserting `T` before the boundary cancels the pending removal and assigns the new
+    /// instance a fresh [`ResourceVersion`].
+    ///
+    /// # Returns
+    /// `true` if the resource was present and not already pending removal.
+    pub fn remove_deferred<T: Resource>(&mut self) -> bool {
+        // safety:
+        // this type is !Send and !Sync, and so can only be accessed from the thread which
+        // owns the resources collection
+        unsafe { self.internal.remove_deferred(&ResourceTypeId::of::<T>()) }
+    }
+
+    /// Physically drops all resources whose removal was deferred with
+    /// [`Resources::remove_deferred`].
+    ///
+    /// This is called automatically by [`Schedule`](crate::systems::Schedule) at each command
+    /// buffer flush boundary. Only call this manually when driving systems without a schedule,
+    /// and only when no system borrows are outstanding.
+    pub fn apply_pending_removals(&mut self) {
+        self.internal.apply_pending_removals();
+    }
+
+    /// Returns the current version of the resource type `T`, if it has ever been inserted.
+    ///
+    /// The version is incremented every time `T` is inserted, allowing stale handles to
+    /// detect that the resource they were fetched from has been replaced.
+    pub fn version<T: Resource>(&self) -> Option<ResourceVersion> {
+        self.internal.version(&ResourceTypeId::of::<T>())
+    }
+
+    /// Returns `true` if a resource of type `T` is present and not pending removal.
+    ///
+    /// Systems which declare a dependency on an unavailable resource are skipped by the
+    /// scheduler.
+    pub fn is_available<T: Resource>(&self) -> bool {
+        self.internal.is_available(&ResourceTypeId::of::<T>())
+    }
+
+    pub(crate) fn is_available_id(&self, type_id: &ResourceTypeId) -> bool {
+        self.internal.is_available(type_id)
+    }
+
     /// Retrieve an immutable reference to  `T` from the store if it exists. Otherwise, return `None`.
     ///
     /// # Panics
@@ -347,16 +479,19 @@ impl Resources {
     /// Attempts to retrieve an immutable reference to `T` from the store. If it does not exist,
     /// the closure `f` is called to construct the object and it is then inserted into the store.
     pub fn get_or_insert_with<T: Resource, F: FnOnce() -> T>(&mut self, f: F) -> AtomicRef<T> {
+        let type_id = &ResourceTypeId::of::<T>();
+        if !self.internal.is_available(type_id) {
+            // either absent, or pending removal - in which case the old instance is logically
+            // gone and is replaced with a fresh version
+            self.insert((f)());
+        }
         // safety:
         // this type is !Send and !Sync, and so can only be accessed from the thread which
         // owns the resources collection
-        let type_id = ResourceTypeId::of::<T>();
-        unsafe {
-            self.internal
-                .entry(type_id)
-                .or_insert_with(|| ResourceCell::new(Box::new((f)())))
-                .get()
-        }
+        self.internal
+            .get(type_id)
+            .map(|x| x.get::<T>())
+            .unwrap_or_else(|| panic_nonexistent_resource(type_id))
     }
 
     /// Attempts to retrieve a mutable reference to `T` from the store. If it does not exist,
@@ -365,16 +500,17 @@ impl Resources {
         &mut self,
         f: F,
     ) -> AtomicRefMut<T> {
+        let type_id = &ResourceTypeId::of::<T>();
+        if !self.internal.is_available(type_id) {
+            self.insert((f)());
+        }
         // safety:
         // this type is !Send and !Sync, and so can only be accessed from the thread which
         // owns the resources collection
-        let type_id = ResourceTypeId::of::<T>();
-        unsafe {
-            self.internal
-                .entry(type_id)
-                .or_insert_with(|| ResourceCell::new(Box::new((f)())))
-                .get_mut()
-        }
+        self.internal
+            .get(type_id)
+            .map(|x| x.get_mut::<T>())
+            .unwrap_or_else(|| panic_nonexistent_resource(type_id))
     }
 
     /// Attempts to retrieve an immutable reference to `T` from the store. If it does not exist,
@@ -479,5 +615,86 @@ mod tests {
         // test re-ownership
         let owned = resources.remove::<TestTwo>();
         assert_eq!(owned.unwrap().value, "two");
+    }
+
+    #[test]
+    fn deferred_removal_takes_effect_at_boundary() {
+        struct TestRes(i32);
+
+        let mut resources = Resources::default();
+        resources.insert(TestRes(1));
+
+        // request deferred removal: logically gone, physically still stored
+        assert!(resources.remove_deferred::<TestRes>());
+        assert!(!resources.is_available::<TestRes>());
+        assert!(resources.get::<TestRes>().is_none());
+        assert!(resources.contains::<TestRes>());
+
+        // a second request is a no-op
+        assert!(!resources.remove_deferred::<TestRes>());
+
+        // the scheduling boundary physically drops the resource
+        resources.apply_pending_removals();
+        assert!(!resources.contains::<TestRes>());
+        assert!(!resources.is_available::<TestRes>());
+
+        // removing a non-existant resource does nothing
+        assert!(!resources.remove_deferred::<TestRes>());
+    }
+
+    #[test]
+    fn reinsertion_after_removal_gets_new_version() {
+        struct TestRes(i32);
+
+        let mut resources = Resources::default();
+        assert_eq!(resources.version::<TestRes>(), None);
+
+        resources.insert(TestRes(1));
+        let v1 = resources.version::<TestRes>().unwrap();
+        assert_eq!(v1, ResourceVersion::INITIAL);
+
+        resources.remove_deferred::<TestRes>();
+        resources.apply_pending_removals();
+
+        // the version survives removal, so re-insertion is visibly a new generation
+        resources.insert(TestRes(2));
+        let v2 = resources.version::<TestRes>().unwrap();
+        assert!(v2 > v1);
+        assert_eq!(resources.get::<TestRes>().unwrap().0, 2);
+    }
+
+    #[test]
+    fn reinsertion_cancels_pending_removal() {
+        struct TestRes(i32);
+
+        let mut resources = Resources::default();
+        resources.insert(TestRes(1));
+        let v1 = resources.version::<TestRes>().unwrap();
+
+        resources.remove_deferred::<TestRes>();
+        // re-insert before the boundary: cancels the pending removal, bumps the version
+        resources.insert(TestRes(2));
+
+        assert!(resources.is_available::<TestRes>());
+        assert!(resources.version::<TestRes>().unwrap() > v1);
+
+        // the boundary must not drop the re-inserted resource
+        resources.apply_pending_removals();
+        assert!(resources.contains::<TestRes>());
+        assert_eq!(resources.get::<TestRes>().unwrap().0, 2);
+    }
+
+    #[test]
+    fn get_or_insert_replaces_pending_removal() {
+        struct TestRes(i32);
+
+        let mut resources = Resources::default();
+        resources.insert(TestRes(1));
+        let v1 = resources.version::<TestRes>().unwrap();
+
+        resources.remove_deferred::<TestRes>();
+        // the logically-removed instance is replaced with a fresh version
+        assert_eq!(resources.get_or_insert::<TestRes>(TestRes(2)).0, 2);
+        assert!(resources.version::<TestRes>().unwrap() > v1);
     }
 }

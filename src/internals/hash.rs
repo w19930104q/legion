@@ -53,12 +53,15 @@ fn hasher() {
     fn verify<T: 'static + ?Sized>() {
         use core::{any::TypeId, hash::Hash};
 
+        // hashing a type ID must go through `write_u64` (not `write`, which is
+        // unimplemented) and must be deterministic
         let mut hasher = ComponentTypeIdHasher::default();
-        let type_id = TypeId::of::<T>();
-        type_id.hash(&mut hasher);
-        assert_eq!(hasher.finish(), unsafe {
-            core::mem::transmute::<TypeId, u64>(type_id)
-        });
+        TypeId::of::<T>().hash(&mut hasher);
+        let first = hasher.finish();
+
+        let mut hasher = ComponentTypeIdHasher::default();
+        TypeId::of::<T>().hash(&mut hasher);
+        assert_eq!(first, hasher.finish());
     }
 
     verify::<usize>();
@@ -66,4 +69,13 @@ fn hasher() {
     verify::<str>();
     verify::<&'static str>();
     verify::<[u8; 20]>();
+
+    // distinct types hash to distinct values
+    fn hash_of<T: 'static>() -> u64 {
+        use core::{any::TypeId, hash::Hash};
+        let mut hasher = ComponentTypeIdHasher::default();
+        TypeId::of::<T>().hash(&mut hasher);
+        hasher.finish()
+    }
+    assert_ne!(hash_of::<usize>(), hash_of::<u8>());
 }

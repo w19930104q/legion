@@ -403,11 +403,21 @@ impl<'a, 'de, W: WorldDeserializer, E: EntitySerializer> DeserializeSeed<'de>
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_map(WorldVisitor {
-            world: self.world,
+        // Deserialize into a temporary world first to ensure atomicity:
+        // if deserialization fails, the target world is left untouched.
+        let mut temp = World::default();
+        let result = deserializer.deserialize_map(WorldVisitor {
+            world: &mut temp,
             world_deserializer: self.world_deserializer,
             entity_serializer: self.entity_serializer,
-        })
+        });
+        match result {
+            Ok(()) => {
+                std::mem::swap(self.world, &mut temp);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -628,5 +638,213 @@ mod test {
         );
 
         assert_eq!(8, world2.len());
+    }
+
+    #[test]
+    fn entity_tree_roundtrip() {
+        // Build a three-level entity tree where each node references its parent
+        #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct Node {
+            parent: Option<Entity>,
+            name: String,
+        }
+
+        let mut world = World::default();
+
+        // Level 1: root
+        let root = world.push((Node {
+            parent: None,
+            name: "root".into(),
+        },));
+
+        // Level 2: children
+        let child1 = world.push((Node {
+            parent: Some(root),
+            name: "child1".into(),
+        },));
+        let child2 = world.push((Node {
+            parent: Some(root),
+            name: "child2".into(),
+        },));
+
+        // Level 3: grandchildren
+        let grandchild1 = world.push((Node {
+            parent: Some(child1),
+            name: "grandchild1".into(),
+        },));
+        let grandchild2 = world.push((Node {
+            parent: Some(child2),
+            name: "grandchild2".into(),
+        },));
+
+        let canon = Canon::default();
+        let mut registry = Registry::<String>::new();
+        registry.register::<Node>("node".to_string());
+
+        // Serialize
+        let json = serde_json::to_value(&world.as_serializable(any(), &registry, &canon)).unwrap();
+
+        // Deserialize into new world
+        use serde::de::DeserializeSeed;
+        let world2: World = registry.as_deserialize(&canon).deserialize(json).unwrap();
+
+        // All entities should exist with the same IDs (same Canon)
+        assert!(world2.contains(root));
+        assert!(world2.contains(child1));
+        assert!(world2.contains(child2));
+        assert!(world2.contains(grandchild1));
+        assert!(world2.contains(grandchild2));
+
+        // Verify tree relationships are preserved
+        let root_entry = world2.entry_ref(root).unwrap();
+        let root_node: &Node = root_entry.get_component::<Node>().unwrap();
+        assert_eq!(root_node.parent, None);
+        assert_eq!(root_node.name, "root");
+
+        let child1_entry = world2.entry_ref(child1).unwrap();
+        let child1_node: &Node = child1_entry.get_component::<Node>().unwrap();
+        assert_eq!(child1_node.parent, Some(root));
+        assert_eq!(child1_node.name, "child1");
+
+        let gc1_entry = world2.entry_ref(grandchild1).unwrap();
+        let gc1_node: &Node = gc1_entry.get_component::<Node>().unwrap();
+        assert_eq!(gc1_node.parent, Some(child1));
+        assert_eq!(gc1_node.name, "grandchild1");
+
+        let gc2_entry = world2.entry_ref(grandchild2).unwrap();
+        let gc2_node: &Node = gc2_entry.get_component::<Node>().unwrap();
+        assert_eq!(gc2_node.parent, Some(child2));
+        assert_eq!(gc2_node.name, "grandchild2");
+    }
+
+    #[test]
+    fn entity_tree_roundtrip_stable() {
+        // Verify that serialize → deserialize → serialize produces the same JSON
+        #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct Tag {
+            target: Entity,
+        }
+
+        let mut world = World::default();
+        let a = world.push((1usize,));
+        let b = world.push((Tag { target: a },));
+        let c = world.push((Tag { target: b },));
+
+        let canon = Canon::default();
+        let mut registry = Registry::<String>::new();
+        registry.register::<usize>("usize".to_string());
+        registry.register::<Tag>("tag".to_string());
+
+        // First serialization
+        let json1 = serde_json::to_value(&world.as_serializable(any(), &registry, &canon)).unwrap();
+
+        // Deserialize
+        use serde::de::DeserializeSeed;
+        let world2: World = registry.as_deserialize(&canon).deserialize(json1.clone()).unwrap();
+
+        // Second serialization (should produce same JSON)
+        let json2 = serde_json::to_value(&world2.as_serializable(any(), &registry, &canon)).unwrap();
+
+        assert_eq!(json1, json2, "round-trip must produce stable serialized output");
+
+        // Verify entity references are correct
+        let entry_b = world2.entry_ref(b).unwrap();
+        let tag_b: &Tag = entry_b.get_component::<Tag>().unwrap();
+        assert_eq!(tag_b.target, a);
+
+        let entry_c = world2.entry_ref(c).unwrap();
+        let tag_c: &Tag = entry_c.get_component::<Tag>().unwrap();
+        assert_eq!(tag_c.target, b);
+    }
+
+    #[test]
+    fn atomic_deserialization_does_not_corrupt_on_error() {
+        // Corrupted JSON should not modify the target world
+        #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct Pos(f32, f32);
+
+        let mut world = World::default();
+        let original = world.push((Pos(1.0, 2.0), 42usize));
+        assert_eq!(world.len(), 1);
+
+        let canon = Canon::default();
+        let mut registry = Registry::<String>::new();
+        registry.register::<Pos>("pos".to_string());
+        registry.register::<usize>("usize".to_string());
+
+        // Use corrupted JSON
+        let corrupted: serde_json::Value = serde_json::json!({
+            "packed": "this is not a valid sequence"
+        });
+
+        use serde::de::DeserializeSeed;
+        let result = registry
+            .as_deserialize_into_world(&mut world, &canon)
+            .deserialize(corrupted);
+
+        assert!(result.is_err(), "corrupted input should fail");
+
+        // World must still be intact
+        assert_eq!(world.len(), 1);
+        assert!(world.contains(original));
+        let entry = world.entry_ref(original).unwrap();
+        let pos: &Pos = entry.get_component::<Pos>().unwrap();
+        assert_eq!(pos.0, 1.0);
+        assert_eq!(pos.1, 2.0);
+        let val: &usize = entry.get_component::<usize>().unwrap();
+        assert_eq!(*val, 42);
+    }
+
+    #[test]
+    fn entity_tree_cross_canon_roundtrip() {
+        // Even with different Canon instances, entity relationships must be preserved
+        #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct Child {
+            parent: Option<Entity>,
+            depth: u32,
+        }
+
+        let mut world = World::default();
+        let root = world.push((Child { parent: None, depth: 0 },));
+
+        let child = world.push((Child { parent: Some(root), depth: 1 },));
+        let grandchild = world.push((Child { parent: Some(child), depth: 2 },));
+
+        let canon1 = Canon::default();
+        let mut registry = Registry::<String>::new();
+        registry.register::<Child>("child".to_string());
+
+        let json = serde_json::to_value(&world.as_serializable(any(), &registry, &canon1)).unwrap();
+
+        // Deserialize with a different Canon
+        let canon2 = Canon::default();
+        use serde::de::DeserializeSeed;
+        let world2: World = registry.as_deserialize(&canon2).deserialize(json).unwrap();
+
+        assert_eq!(world2.len(), 3);
+
+        // Use Read query to find entity components
+        use crate::{Read, IntoQuery};
+        let mut query = <Read<Child>>::query();
+        let mut found = Vec::new();
+        for c in query.iter(&world2) {
+            found.push((c.parent, c.depth));
+        }
+        assert_eq!(found.len(), 3);
+
+        // Find each entity by depth
+        let mut child_id = None;
+        let mut grandchild_id = None;
+        for (parent, depth) in &found {
+            match *depth {
+                0 => assert!(parent.is_none()),
+                1 => child_id = *parent,
+                2 => grandchild_id = *parent,
+                _ => {}
+            }
+        }
+
+        assert!(child_id.is_some(), "child should reference root");
+        assert!(grandchild_id.is_some(), "grandchild should reference child");
     }
 }

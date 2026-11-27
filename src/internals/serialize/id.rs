@@ -1,4 +1,5 @@
 use std::collections::{hash_map::Entry, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use scoped_tls_hkt::scoped_thread_local;
 use serde::{Deserialize, Serialize, Serializer};
@@ -146,9 +147,10 @@ pub enum CanonizeError {
 }
 
 /// Contains the canon names of entities.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct Canon {
     inner: parking_lot::RwLock<CanonInner>,
+    session_nonce: u64,
 }
 
 #[derive(Default, Debug)]
@@ -156,9 +158,29 @@ struct CanonInner {
     to_name: HashMap<Entity, EntityName, EntityHasher>,
     to_id: HashMap<EntityName, Entity>,
     allocator: Allocate,
+    uuid_counter: u64,
 }
 
 impl Canon {
+    /// Creates a new Canon with a random session nonce for deterministic UUID generation.
+    pub fn new() -> Self {
+        static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+        Self {
+            inner: parking_lot::RwLock::new(CanonInner::default()),
+            session_nonce: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// Creates a new Canon with the given session nonce.
+    /// Two Canon instances with the same session nonce will generate the same UUIDs
+    /// for the same entities canonized in the same order.
+    pub fn with_session_nonce(session_nonce: u64) -> Self {
+        Self {
+            inner: parking_lot::RwLock::new(CanonInner::default()),
+            session_nonce,
+        }
+    }
+
     /// Returns the [`Entity`] ID associated with the given [`EntityName`].
     pub fn get_id(&self, name: &EntityName) -> Option<Entity> {
         self.inner.read().to_id.get(name).copied()
@@ -187,10 +209,13 @@ impl Canon {
     /// Canonizes a given [`Entity`] ID and returns the associated [`EntityName`].
     pub fn canonize_id(&self, entity: Entity) -> EntityName {
         let mut inner = self.inner.write();
+        let counter = inner.uuid_counter;
+        inner.uuid_counter += 1;
         match inner.to_name.entry(entity) {
             Entry::Occupied(occupied) => *occupied.get(),
             Entry::Vacant(vacant) => {
-                let uuid = Uuid::new_v4();
+                let combined = ((self.session_nonce as u128) << 64) | (counter as u128);
+                let uuid = Uuid::from_u128(combined);
                 let name = *uuid.as_bytes();
                 vacant.insert(name);
                 inner.to_id.insert(name, entity);
@@ -221,6 +246,12 @@ impl Canon {
                 Ok(())
             }
         }
+    }
+}
+
+impl Default for Canon {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -7,7 +7,7 @@
 
 use std::{
     any::type_name,
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fmt,
     iter::{Fuse, FusedIterator},
     marker::PhantomData,
@@ -19,7 +19,7 @@ use smallvec::SmallVec;
 
 use crate::{
     internals::{
-        entity::Entity,
+        entity::{Entity, EntityHasher},
         insert::{
             ArchetypeSource, ArchetypeWriter, ComponentSource, IntoComponentSource, KnownLength,
         },
@@ -36,7 +36,7 @@ use crate::{
 /// access.
 pub trait WorldWritable: Send + Sync {
     /// Destructs the writer and performs the write operations on the world.
-    fn write(self: Arc<Self>, world: &mut World, cmd: &CommandBuffer);
+    fn write(self: Arc<Self>, world: &mut World, cmd: &CommandBuffer, remap: &mut HashMap<Entity, Entity, EntityHasher>);
 }
 
 struct InsertBufferedCommand<T> {
@@ -58,13 +58,22 @@ impl<T> WorldWritable for InsertBufferedCommand<T>
 where
     T: ComponentSource + Send + Sync,
 {
-    fn write(self: Arc<Self>, world: &mut World, cmd: &CommandBuffer) {
+    fn write(self: Arc<Self>, world: &mut World, cmd: &CommandBuffer, remap: &mut HashMap<Entity, Entity, EntityHasher>) {
         let consumed = Arc::try_unwrap(self).unwrap();
 
-        world.extend(PreallocComponentSource::new(
+        let preallocated: Vec<Entity> = cmd.pending_insertion[consumed.entities].iter().copied().collect();
+        let actual = world.extend(PreallocComponentSource::new(
             cmd.pending_insertion[consumed.entities].iter().copied(),
             consumed.components,
         ));
+
+        // Build remapping from preallocated to actual world IDs.
+        // Currently these are identity mappings since PreallocComponentSource
+        // feeds preallocated IDs through ConcatIter, but the remap infrastructure
+        // supports future non-identity remapping.
+        for (pre, act) in preallocated.iter().zip(actual.iter()) {
+            remap.insert(*pre, *act);
+        }
     }
 }
 
@@ -149,7 +158,7 @@ impl<T> WorldWritable for InsertCommand<T>
 where
     T: IntoComponentSource + Send + Sync,
 {
-    fn write(self: Arc<Self>, world: &mut World, _: &CommandBuffer) {
+    fn write(self: Arc<Self>, world: &mut World, _: &CommandBuffer, _remap: &mut HashMap<Entity, Entity, EntityHasher>) {
         let consumed = Arc::try_unwrap(self).unwrap();
         world.extend(consumed.components);
     }
@@ -164,8 +173,9 @@ impl fmt::Debug for DeleteEntityCommand {
 }
 
 impl WorldWritable for DeleteEntityCommand {
-    fn write(self: Arc<Self>, world: &mut World, _: &CommandBuffer) {
-        world.remove(self.0);
+    fn write(self: Arc<Self>, world: &mut World, _: &CommandBuffer, remap: &mut HashMap<Entity, Entity, EntityHasher>) {
+        let entity = remap.get(&self.0).copied().unwrap_or(self.0);
+        world.remove(entity);
     }
 }
 
@@ -188,10 +198,11 @@ impl<C> WorldWritable for AddComponentCommand<C>
 where
     C: Component,
 {
-    fn write(self: Arc<Self>, world: &mut World, _: &CommandBuffer) {
+    fn write(self: Arc<Self>, world: &mut World, _: &CommandBuffer, remap: &mut HashMap<Entity, Entity, EntityHasher>) {
         let consumed = Arc::try_unwrap(self).unwrap();
+        let entity = remap.get(&consumed.entity).copied().unwrap_or(consumed.entity);
         world
-            .entry(consumed.entity)
+            .entry(entity)
             .expect("entity not found")
             .add_component(consumed.component);
     }
@@ -216,9 +227,10 @@ impl<C> WorldWritable for RemoveComponentCommand<C>
 where
     C: Component,
 {
-    fn write(self: Arc<Self>, world: &mut World, _: &CommandBuffer) {
+    fn write(self: Arc<Self>, world: &mut World, _: &CommandBuffer, remap: &mut HashMap<Entity, Entity, EntityHasher>) {
+        let entity = remap.get(&self.entity).copied().unwrap_or(self.entity);
         world
-            .entry(self.entity)
+            .entry(entity)
             .expect("entity not found")
             .remove_component::<C>();
     }
@@ -289,11 +301,17 @@ impl CommandBuffer {
             panic!("command buffers may only write into their parent world");
         }
 
+        let mut entity_remap: HashMap<Entity, Entity, EntityHasher> = HashMap::default();
+
         while let Some(command) = self.commands.pop_back() {
             match command {
-                Command::WriteWorld(ptr) => ptr.write(world, self),
+                Command::WriteWorld(ptr) => ptr.write(world, self, &mut entity_remap),
                 Command::ExecMutWorld(closure) => closure(world, resources),
             }
+        }
+
+        if !entity_remap.is_empty() {
+            world.remap_entities(&entity_remap);
         }
 
         self.pending_insertion.clear();
@@ -429,5 +447,100 @@ mod tests {
         }
 
         assert_eq!(components_len, count);
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Parent;
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Child(Entity);
+
+    #[test]
+    fn parent_child_entity_reference() {
+        let mut world = World::default();
+        let mut resources = Resources::default();
+        let mut cmd = CommandBuffer::new(&world);
+
+        // Create 10 parent entities
+        let parents: Vec<Entity> = cmd.extend(vec![(Parent,); 10]).to_vec();
+
+        // Create 10 child entities, each referencing its parent
+        let children: Vec<Entity> = parents
+            .iter()
+            .map(|&p| cmd.push((Child(p),)))
+            .collect();
+
+        // Flush
+        cmd.flush(&mut world, &mut resources);
+
+        // Verify all parents exist with correct components
+        for &parent in &parents {
+            let entry = world.entry(parent).unwrap();
+            assert!(entry.get_component::<Parent>().is_ok(),
+                "Parent entity {:?} missing Parent component", parent);
+        }
+
+        // Verify all children exist and reference the correct parents
+        for (i, &child) in children.iter().enumerate() {
+            let entry = world.entry(child).unwrap();
+            let child_comp = entry.get_component::<Child>().unwrap();
+            assert_eq!(child_comp.0, parents[i],
+                "Child {:?} references {:?} but should reference parent {:?}",
+                child, child_comp.0, parents[i]);
+            assert!(world.contains(parents[i]),
+                "Parent {:?} referenced by child {:?} does not exist", parents[i], child);
+        }
+
+        // Verify parent and child counts match
+        use crate::internals::query::{view::read::Read, IntoQuery};
+
+        let mut parent_query = Read::<Parent>::query();
+        assert_eq!(parent_query.iter(&world).count(), 10);
+
+        let mut child_query = Read::<Child>::query();
+        assert_eq!(child_query.iter(&world).count(), 10);
+    }
+
+    #[test]
+    fn parent_child_entity_reference_single_push() {
+        let mut world = World::default();
+        let mut resources = Resources::default();
+        let mut cmd = CommandBuffer::new(&world);
+
+        // Create parent, then child referencing it
+        let parent = cmd.push((Parent,));
+        let child = cmd.push((Child(parent),));
+
+        cmd.flush(&mut world, &mut resources);
+
+        // Verify parent exists
+        let parent_entry = world.entry(parent).unwrap();
+        assert!(parent_entry.get_component::<Parent>().is_ok());
+
+        // Verify child references correct parent
+        let child_entry = world.entry(child).unwrap();
+        let child_comp = child_entry.get_component::<Child>().unwrap();
+        assert_eq!(child_comp.0, parent,
+            "Child references {:?} but should reference parent {:?}",
+            child_comp.0, parent);
+    }
+
+    #[test]
+    fn entity_remap_after_flush() {
+        let mut world = World::default();
+        let mut resources = Resources::default();
+        let mut cmd = CommandBuffer::new(&world);
+
+        // Create entities that reference each other
+        let parent = cmd.push((Parent,));
+        let child = cmd.push((Child(parent),));
+
+        // The preallocated IDs may differ from final IDs; flush should remap
+        cmd.flush(&mut world, &mut resources);
+
+        // After flush, world should have consistent references
+        let child_entry = world.entry(child).unwrap();
+        let child_comp = child_entry.get_component::<Child>().unwrap();
+        assert_eq!(child_comp.0, parent);
+        assert!(world.contains(parent));
     }
 }

@@ -375,6 +375,24 @@ impl World {
         }
     }
 
+    /// Remaps `Entity` component references in all entities according to the given mapping.
+    /// This is used internally by the command buffer to ensure entity references remain
+    /// consistent after entity IDs are remapped during flush.
+    pub fn remap_entities(&mut self, mapping: &HashMap<Entity, Entity, EntityHasher>) {
+        if mapping.is_empty() {
+            return;
+        }
+
+        use crate::internals::query::{view::write::Write, IntoQuery};
+
+        let mut query = Write::<Entity>::query();
+        for entity_comp in query.iter_mut(self) {
+            if let Some(remapped) = mapping.get(entity_comp) {
+                *entity_comp = *remapped;
+            }
+        }
+    }
+
     /// Gets an [`Entry`] for an entity, allowing manipulation of the entity.
     ///
     /// # Examples

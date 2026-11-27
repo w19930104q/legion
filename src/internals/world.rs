@@ -91,7 +91,6 @@ pub struct WorldOptions {
 /// arbitrary collection of [`Component`]s attached.
 ///
 /// The entities in a world may be efficiently searched and iterated via [queries](crate::query).
-#[derive(Debug)]
 pub struct World {
     id: WorldId,
     index: SearchIndex,
@@ -102,6 +101,23 @@ pub struct World {
     entities: LocationMap,
     allocation_buffer: Vec<Entity>,
     subscribers: Subscribers,
+    pub(crate) deferred_ops: Vec<Box<dyn FnOnce(&mut World)>>,
+}
+
+impl std::fmt::Debug for World {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("World")
+            .field("id", &self.id)
+            .field("index", &self.index)
+            .field("components", &self.components)
+            .field("groups", &self.groups)
+            .field("group_members", &self.group_members)
+            .field("archetypes", &self.archetypes)
+            .field("entities", &self.entities)
+            .field("allocation_buffer", &self.allocation_buffer)
+            .field("subscribers", &self.subscribers)
+            .finish()
+    }
 }
 
 impl Default for World {
@@ -138,6 +154,7 @@ impl World {
             entities: LocationMap::default(),
             allocation_buffer: Vec::default(),
             subscribers: Subscribers::default(),
+            deferred_ops: Vec::new(),
         }
     }
 
@@ -166,6 +183,7 @@ impl World {
     where
         Option<T>: IntoComponentSource,
     {
+        self.flush();
         self.remove(entity_id);
 
         let mut components = <Option<T> as IntoComponentSource>::into(Some(components));
@@ -218,6 +236,16 @@ impl World {
         o.0.unwrap()
     }
 
+    /// Flushes all deferred archetype transfer operations.
+    /// This must be called before any query that should see the results of
+    /// deferred component additions or removals.
+    pub fn flush(&mut self) {
+        let ops = std::mem::take(&mut self.deferred_ops);
+        for op in ops {
+            op(self);
+        }
+    }
+
     /// Appends a collection of entities to the world. Returns the IDs of the new entities.
     ///
     /// # Examples
@@ -248,6 +276,7 @@ impl World {
     /// ```
     /// SoA inserts require all vectors to have the same length. These inserts are faster than inserting via an iterator of tuples.
     pub fn extend(&mut self, components: impl IntoComponentSource) -> &[Entity] {
+        self.flush();
         let mut self_alloc_buf = mem::take(&mut self.allocation_buffer);
         self_alloc_buf.clear();
         self.extend_out(components, &mut self_alloc_buf);
@@ -318,6 +347,7 @@ impl World {
         S: IntoComponentSource,
         E: for<'a> Extend<&'a Entity>,
     {
+        self.flush();
         let replaced = {
             let mut components = components.into();
 
@@ -342,6 +372,7 @@ impl World {
 
     /// Removes the specified entity from the world. Returns `true` if an entity was removed.
     pub fn remove(&mut self, entity: Entity) -> bool {
+        self.flush();
         let location = self.entities.remove(entity);
         if let Some(location) = location {
             self.remove_at_location(location);
@@ -367,6 +398,7 @@ impl World {
 
     /// Removes all entities from the world.
     pub fn clear(&mut self) {
+        self.flush();
         use crate::internals::query::IntoQuery;
         let mut all = Entity::query();
         let entities = all.iter(self).copied().collect::<Vec<_>>();
@@ -389,6 +421,7 @@ impl World {
     /// }
     /// ```
     pub fn entry(&mut self, entity: Entity) -> Option<Entry> {
+        self.flush();
         self.entities
             .get(entity)
             .map(move |location| Entry::new(location, self))

@@ -63,6 +63,7 @@ fn add_background_entities(world: &mut World, count: usize) {
         5,
         count,
     );
+    world.flush();
 }
 
 fn setup(n: usize) -> World {

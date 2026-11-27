@@ -297,6 +297,10 @@ impl CommandBuffer {
         }
 
         self.pending_insertion.clear();
+
+        // Flush any deferred world operations (e.g., component additions/removals
+        // queued by WorldWritable implementations)
+        world.flush();
     }
 
     /// Executes an arbitrary closure against the mutable world, allowing for queued exclusive

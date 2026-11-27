@@ -248,6 +248,8 @@ fn mutate_add_component() {
         .unwrap()
         .add_component(Scale(0.5, 0.5, 0.5));
 
+    world.flush();
+
     assert_eq!(3, query_without_scale.iter(&world).count());
     assert_eq!(1, query_with_scale.iter(&world).count());
 }
@@ -271,6 +273,8 @@ fn mutate_remove_component() {
     assert_eq!(3, query_with_rot.iter(&world).count());
 
     world.entry(entities[1]).unwrap().remove_component::<Rot>();
+
+    world.flush();
 
     assert_eq!(1, query_without_rot.iter(&world).count());
     assert_eq!(2, query_with_rot.iter(&world).count());

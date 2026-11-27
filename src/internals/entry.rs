@@ -451,7 +451,26 @@ impl<'a> Entry<'a> {
 
     /// Adds a new component to the entity.
     /// If the component already exists, its value will be replaced.
+    /// If the component is new, the archetype transfer is deferred until the world
+    /// is flushed so that ongoing iteration is not disrupted.
     pub fn add_component<T: Component>(&mut self, component: T) {
+        if let Ok(comp) = self.get_component_mut::<T>() {
+            *comp = component;
+            return;
+        }
+
+        let entity = self.world.archetypes()[self.location.archetype()]
+            .entities()[self.location.component().0];
+        self.world.deferred_ops.push(Box::new(move |world| {
+            if let Some(mut entry) = world.entry(entity) {
+                entry.add_component_immediate(component);
+            }
+        }));
+    }
+
+    fn add_component_immediate<T: Component>(&mut self, component: T) {
+        // If component already exists (e.g., added by a previous deferred op),
+        // just update the value in place.
         if let Ok(comp) = self.get_component_mut::<T>() {
             *comp = component;
             return;
@@ -486,7 +505,23 @@ impl<'a> Entry<'a> {
 
     /// Removes a component from the entity.
     /// Does nothing if the entity does not have the component.
+    /// If the component exists, the archetype transfer is deferred until the world
+    /// is flushed so that ongoing iteration is not disrupted.
     pub fn remove_component<T: Component>(&mut self) {
+        if !self.archetype().layout().has_component::<T>() {
+            return;
+        }
+
+        let entity = self.world.archetypes()[self.location.archetype()]
+            .entities()[self.location.component().0];
+        self.world.deferred_ops.push(Box::new(move |world| {
+            if let Some(mut entry) = world.entry(entity) {
+                entry.remove_component_immediate::<T>();
+            }
+        }));
+    }
+
+    fn remove_component_immediate<T: Component>(&mut self) {
         if !self.archetype().layout().has_component::<T>() {
             return;
         }
@@ -581,8 +616,12 @@ mod test {
             let mut entry = world.entry(entities[0]).unwrap();
             assert!(entry.get_component::<f32>().is_err());
             entry.add_component(5f32);
-            assert_eq!(entry.get_component::<f32>(), Ok(&5f32));
         }
+        // Flush deferred operations before checking results
+        world.flush();
+
+        let mut entry = world.entry(entities[0]).unwrap();
+        assert_eq!(entry.get_component::<f32>(), Ok(&5f32));
 
         let after = query.iter(&world).collect::<Vec<_>>();
         assert_eq!(after.len(), 1);
@@ -605,11 +644,140 @@ mod test {
             let mut entry = world.entry(entities[0]).unwrap();
             assert_eq!(entry.get_component::<usize>(), Ok(&1usize));
             entry.remove_component::<usize>();
-            assert!(entry.get_component::<usize>().is_err());
         }
+        // Flush deferred operations before checking results
+        world.flush();
+
+        let mut entry = world.entry(entities[0]).unwrap();
+        assert!(entry.get_component::<usize>().is_err());
 
         let after = query.iter(&world).collect::<Vec<_>>();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0], &2usize);
     }
-}
+
+    #[test]
+    fn add_component_during_iteration_no_double_visit() {
+        let mut world = World::default();
+
+        // Create 32 entities with one component
+        let entities = world.extend((0..32).map(|i| (i,)).collect::<Vec<_>>()).to_vec();
+
+        let mut query = Read::<i32>::query();
+
+        // Iterate and add a component — should visit each entity exactly once
+        let entities_to_modify: Vec<_> = query.iter(&world).copied().collect();
+        drop(query);
+
+        for entity in &entities_to_modify {
+            let mut entry = world.entry(*entity).unwrap();
+            entry.add_component(entity.0.get() as f32);
+        }
+
+        // Flush deferred operations
+        world.flush();
+
+        // Verify each entity was modified exactly once
+        let mut query2 = <(Entity, Read<f32>)>::query();
+        let mut count = 0;
+        for (e, val) in query2.iter(&world) {
+            assert_eq!(*val, e.0.get() as f32);
+            count += 1;
+        }
+        assert_eq!(count, 32);
+    }
+
+    #[test]
+    fn add_component_during_iteration_with_flush() {
+        let mut world = World::default();
+
+        // Create 32 entities
+        let entities = world.extend((0..32).map(|i| (i,)).collect::<Vec<_>>()).to_vec();
+
+        // First pass: iterate and add components
+        {
+            let entities_to_modify: Vec<_> = {
+                let mut query = Read::<i32>::query();
+                query.iter(&world).copied().collect()
+            };
+
+            for entity in &entities_to_modify {
+                let mut entry = world.entry(*entity).unwrap();
+                entry.add_component(entity.0.get() as f32);
+            }
+        }
+
+        // Flush before next query
+        world.flush();
+
+        // Second pass: verify each entity has the new component
+        let mut query2 = <(Entity, Read<i32>, Read<f32>)>::query();
+        let mut count = 0;
+        for (e, i, f) in query2.iter(&world) {
+            assert_eq!(*i, e.0.get() as i32);
+            assert_eq!(*f, e.0.get() as f32);
+            count += 1;
+        }
+        assert_eq!(count, 32);
+    }
+
+    #[test]
+    fn remove_component_during_iteration() {
+        let mut world = World::default();
+
+        // Create 32 entities with two components
+        let entities = world.extend(
+            (0..32).map(|i| (i, i as f32)).collect::<Vec<_>>()
+        ).to_vec();
+
+        // Remove one component from all entities
+        {
+            let entities_to_modify: Vec<_> = {
+                let mut query = <(Entity, Read<f32>)>::query();
+                query.iter(&world).map(|(e, _)| *e).collect()
+            };
+
+            for entity in &entities_to_modify {
+                let mut entry = world.entry(*entity).unwrap();
+                entry.remove_component::<f32>();
+            }
+        }
+
+        // Flush deferred operations
+        world.flush();
+
+        // Verify f32 components were removed
+        let mut query = Read::<f32>::query();
+        assert_eq!(query.iter(&world).count(), 0);
+
+        // But i32 components remain
+        let mut query2 = Read::<i32>::query();
+        assert_eq!(query2.iter(&world).count(), 32);
+    }
+
+    #[test]
+    fn wrong_component_type_no_migration() {
+        // Adding a component type that already exists should not trigger
+        // entity migration, just update the value in place.
+        let mut world = World::default();
+        let entity = world.push((1usize,));
+
+        {
+            let mut entry = world.entry(entity).unwrap();
+            // Component already exists — update in place, no migration
+            entry.add_component(42usize);
+            // This should work immediately (no deferral needed)
+            assert_eq!(entry.get_component::<usize>(), Ok(&42usize));
+        }
+
+        // Removing a component that doesn't exist should be a no-op
+        {
+            let mut entry = world.entry(entity).unwrap();
+            entry.remove_component::<f32>();
+            // No migration triggered since f32 doesn't exist
+            assert!(entry.get_component::<f32>().is_err());
+        }
+
+        world.flush();
+        assert_eq!(world.entry(entity).unwrap().get_component::<usize>(), Ok(&42usize));
+    }

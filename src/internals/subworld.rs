@@ -1,6 +1,7 @@
 //! Contains types related to the [`SubWorld`] which can split a world by component type access.
 
 use std::borrow::Cow;
+use std::fmt;
 
 use bit_set::BitSet;
 
@@ -49,6 +50,69 @@ impl ArchetypeAccess {
     }
 }
 
+/// Error returned when a SubWorld split fails due to insufficient access permissions.
+#[derive(Clone, Debug)]
+pub struct SubWorldAccessError {
+    message: String,
+}
+
+impl fmt::Display for SubWorldAccessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SubWorld access error: {}", self.message)
+    }
+}
+
+impl std::error::Error for SubWorldAccessError {}
+
+/// Describes a conflict between two systems detected during schedule validation.
+#[derive(Clone, Debug)]
+pub struct ScheduleConflict {
+    /// Name of the first system involved in the conflict.
+    pub system_a: String,
+    /// Name of the second system involved in the conflict.
+    pub system_b: String,
+    /// Description of what resource or component caused the conflict.
+    pub resource: String,
+}
+
+impl fmt::Display for ScheduleConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Schedule conflict: system '{}' and system '{}' both require conflicting access to '{}'",
+            self.system_a, self.system_b, self.resource
+        )
+    }
+}
+
+/// Collection of schedule conflicts detected during validation.
+#[derive(Clone, Debug, Default)]
+pub struct ScheduleConflicts {
+    /// List of detected conflicts.
+    pub conflicts: Vec<ScheduleConflict>,
+}
+
+impl ScheduleConflicts {
+    /// Returns true if there are no conflicts.
+    pub fn is_empty(&self) -> bool {
+        self.conflicts.is_empty()
+    }
+}
+
+impl fmt::Display for ScheduleConflicts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.conflicts.is_empty() {
+            write!(f, "No schedule conflicts detected")
+        } else {
+            writeln!(f, "Schedule conflicts detected:")?;
+            for conflict in &self.conflicts {
+                writeln!(f, "  - {}", conflict)?;
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Describes which components are available for access.
 #[derive(Clone, Debug)]
 pub enum ComponentAccess<'a> {
@@ -81,7 +145,25 @@ impl<'a> ComponentAccess<'a> {
 
     /// Splits this permission set into two; the left access only allows the permissions given, while the right
     /// allows only what is left from this set after subtracting said permissions.
+    ///
+    /// # Panics
+    /// Panics if the requested access is not available in this permission set.
     pub(crate) fn split(&mut self, access: Permissions<ComponentTypeId>) -> (Self, Self) {
+        match self.try_split(access) {
+            Ok(result) => result,
+            Err(e) => panic!("{}", e),
+        }
+    }
+
+    /// Attempts to split this permission set into two. Returns an error if the requested access
+    /// is not available in this permission set.
+    ///
+    /// The left access only allows the permissions given, while the right
+    /// allows only what is left from this set after subtracting said permissions.
+    pub fn try_split(
+        &mut self,
+        access: Permissions<ComponentTypeId>,
+    ) -> Result<(Self, Self), SubWorldAccessError> {
         fn append_incompatible(
             denied: &mut Permissions<ComponentTypeId>,
             to_deny: &Permissions<ComponentTypeId>,
@@ -114,7 +196,7 @@ impl<'a> ComponentAccess<'a> {
             denied
         }
 
-        match self {
+        let result = match self {
             Self::All => {
                 let denied = incompatible(&access);
                 (
@@ -124,7 +206,12 @@ impl<'a> ComponentAccess<'a> {
             }
             Self::Allow(allowed) => {
                 if !allowed.is_superset(&access) {
-                    panic!("view accesses components unavailable in this world: world allows only {}, view requires {}", allowed, access);
+                    return Err(SubWorldAccessError {
+                        message: format!(
+                            "view accesses components unavailable in this world: world allows only {}, view requires {}",
+                            allowed, access
+                        ),
+                    });
                 }
 
                 let mut allowed = allowed.clone();
@@ -134,13 +221,45 @@ impl<'a> ComponentAccess<'a> {
             }
             Self::Disallow(denied) => {
                 if !denied.is_disjoint(&access) {
-                    panic!("view accesses components unavailable in this world: world disallows {}, view requires {}", denied, access);
+                    return Err(SubWorldAccessError {
+                        message: format!(
+                            "view accesses components unavailable in this world: world disallows {}, view requires {}",
+                            denied, access
+                        ),
+                    });
                 }
 
                 let mut denied = denied.clone();
                 append_incompatible(denied.to_mut(), &access);
 
                 (Self::Allow(Cow::Owned(access)), Self::Disallow(denied))
+            }
+        };
+
+        Ok(result)
+    }
+
+    /// Validates that this component access is internally consistent and can support
+    /// the expected read/write patterns. Returns the set of conflicts if any.
+    pub fn validate(&self) -> Result<(), SubWorldAccessError> {
+        match self {
+            Self::All => Ok(()),
+            Self::Allow(permissions) => {
+                // Check that the permissions are well-formed
+                if permissions.reads().is_empty() && permissions.writes().is_empty() {
+                    return Err(SubWorldAccessError {
+                        message: "ComponentAccess::Allow with empty permissions".to_string(),
+                    });
+                }
+                Ok(())
+            }
+            Self::Disallow(permissions) => {
+                if permissions.reads().is_empty() && permissions.writes().is_empty() {
+                    return Err(SubWorldAccessError {
+                        message: "ComponentAccess::Disallow with empty permissions".to_string(),
+                    });
+                }
+                Ok(())
             }
         }
     }
@@ -206,6 +325,9 @@ impl<'a> SubWorld<'a> {
     ///
     /// In this second example, `left` is provided access _only_ to `&Position`. `right` is granted permission
     /// to everything _but_ `&mut Position`.
+    ///
+    /// # Panics
+    /// Panics if the requested access is not available in this SubWorld's permission set.
     pub fn split<'b, T: IntoView>(&'b mut self) -> (SubWorld<'b>, SubWorld<'b>)
     where
         'a: 'b,
@@ -227,6 +349,34 @@ impl<'a> SubWorld<'a> {
         )
     }
 
+    /// Attempts to split the world into two. Returns an error if the requested access
+    /// is not available in this SubWorld's permission set.
+    ///
+    /// The left world allows access only to the data declared by the view;
+    /// the right world allows access to all else.
+    pub fn try_split<'b, T: IntoView>(
+        &'b mut self,
+    ) -> Result<(SubWorld<'b>, SubWorld<'b>), SubWorldAccessError>
+    where
+        'a: 'b,
+    {
+        let permissions = T::View::requires_permissions();
+        let (left, right) = self.components.try_split(permissions)?;
+
+        Ok((
+            SubWorld {
+                world: self.world,
+                components: left,
+                archetypes: self.archetypes,
+            },
+            SubWorld {
+                world: self.world,
+                components: right,
+                archetypes: self.archetypes,
+            },
+        ))
+    }
+
     /// Splits the world into two. The left world allows access only to the data declared by the query's view;
     /// the right world allows access to all else.
     pub fn split_for_query<'q, V: IntoView, F: EntityFilter>(
@@ -234,6 +384,20 @@ impl<'a> SubWorld<'a> {
         _: &'q Query<V, F>,
     ) -> (SubWorld, SubWorld) {
         self.split::<V>()
+    }
+
+    /// Attempts to split the world for the given query. Returns an error if the requested access
+    /// is not available in this SubWorld's permission set.
+    pub fn try_split_for_query<'q, V: IntoView, F: EntityFilter>(
+        &mut self,
+        _: &'q Query<V, F>,
+    ) -> Result<(SubWorld, SubWorld), SubWorldAccessError> {
+        self.try_split::<V>()
+    }
+
+    /// Returns a reference to the component access permissions for this SubWorld.
+    pub fn component_access(&self) -> &ComponentAccess<'a> {
+        &self.components
     }
 
     fn validate_archetype_access(&self, ArchetypeIndex(arch_index): ArchetypeIndex) -> bool {
@@ -437,5 +601,67 @@ mod tests {
         // right should read and write C
         assert!(right_entry.get_component::<C>().is_ok());
         assert!(right_entry.get_component_mut::<C>().is_ok());
+    }
+
+    #[test]
+    fn try_split_insufficient_permissions() {
+        let mut world = World::default();
+        let entity = world.push((1usize, false));
+
+        // Only declare read access for usize
+        let (mut left, mut right) = world.split::<Read<usize>>();
+
+        // Try to split left for write access - should fail
+        let result = left.try_split::<Write<usize>>();
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("unavailable"));
+    }
+
+    #[test]
+    fn try_split_valid_permissions() {
+        let mut world = World::default();
+        let entity = world.push((1usize, false));
+
+        // Declare write access for usize
+        let (mut left, mut right) = world.split::<Write<usize>>();
+
+        // Try to split left for write access - should succeed
+        let result = left.try_split::<Write<usize>>();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn schedule_conflict_formatting() {
+        let conflict = super::ScheduleConflict {
+            system_a: "physics".to_string(),
+            system_b: "render".to_string(),
+            resource: "DeltaTime".to_string(),
+        };
+        let msg = conflict.to_string();
+        assert!(msg.contains("physics"));
+        assert!(msg.contains("render"));
+        assert!(msg.contains("DeltaTime"));
+    }
+
+    #[test]
+    fn schedule_conflicts_empty() {
+        let conflicts = super::ScheduleConflicts::default();
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn schedule_conflicts_display() {
+        let mut conflicts = super::ScheduleConflicts::default();
+        conflicts.conflicts.push(super::ScheduleConflict {
+            system_a: "a".to_string(),
+            system_b: "b".to_string(),
+            resource: "R".to_string(),
+        });
+        let msg = conflicts.to_string();
+        assert!(msg.contains("a"));
+        assert!(msg.contains("b"));
+        assert!(msg.contains("R"));
     }
 }

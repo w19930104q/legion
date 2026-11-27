@@ -1,0 +1,17 @@
+{
+  "root": "/home/liiing/feedback/uid40826",
+  "B": "/home/liiing/feedback/uid40826",
+  "sha": "d0dfcd70ad021b3cb02bc481f134dcae1b874c30",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "amethyst",
+    "repo": "legion",
+    "sha": "d0dfcd70ad021b3cb02bc481f134dcae1b874c30"
+  },
+  "fork": {
+    "owner": "w19930104q",
+    "repo": "legion",
+    "cloneUrl": "https://github.com/w19930104q/legion.git"
+  },
+  "at": "2026-11-27T01:47:00.316Z"
+}

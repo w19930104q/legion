@@ -1,0 +1,18 @@
+{
+  "uid": "40826",
+  "harness": "Codex CLI",
+  "snapshotUrl": "https://github.com/w19930104q/legion/commit/d0dfcd70ad021b3cb02bc481f134dcae1b874c30",
+  "harnessVersion": "codex-cli 0.167.1",
+  "operatingSystem": "Ubuntu 26.04.1 LTS",
+  "operatingSystemCell": [
+    "MacOS/Linux"
+  ],
+  "outputDirectory": "/home/liiing/feedback/uid40826",
+  "wslDistro": "Ubuntu-26.04",
+  "B": {
+    "success": false,
+    "side": "B",
+    "error": "当前执行失败：Reconnecting... 1/5 (unexpected status 404 Not Found: {\"error\":\"unsupported_route\",\"path\":\"/v1/responses\"}, url: http://127.0.0.1:18899/v1/responses)",
+    "attempts": 11
+  }
+}

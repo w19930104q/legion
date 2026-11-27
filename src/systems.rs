@@ -6,3 +6,5 @@ pub use crate::internals::systems::{
     schedule::{Builder, Executor, ParallelRunnable, Runnable, Schedule, Step},
     system::{QuerySet, System, SystemAccess, SystemBuilder, SystemFn, SystemId},
 };
+
+pub use crate::internals::subworld::{ScheduleConflict, ScheduleConflicts, SubWorldAccessError};
